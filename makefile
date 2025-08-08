@@ -1,8 +1,10 @@
-LDLIBS=-lpcap
+LDLIBS=-lpcap -lpthread
 
 all: arp-spoof
 
-main.o: mac.h ip.h ethhdr.h arphdr.h util.h main.cpp
+main.o: main.cpp
+
+iphdr.o : ip.h iphdr.h iphdr.cpp
 
 arphdr.o: mac.h ip.h arphdr.h arphdr.cpp
 
@@ -12,7 +14,7 @@ ip.o: ip.h ip.cpp
 
 mac.o : mac.h mac.cpp
 
-arp-spoof: main.o arphdr.o ethhdr.o ip.o mac.o
+arp-spoof: main.o iphdr.o arphdr.o ethhdr.o ip.o mac.o
 	$(LINK.cc) $^ $(LOADLIBES) $(LDLIBS) -o $@
 
 clean:

